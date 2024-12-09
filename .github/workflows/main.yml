@@ -1,0 +1,180 @@
+name: cf-build-deploy
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch: {}
+
+jobs:
+  Setup:
+    name: Setup
+    runs-on: [self-hosted, Linux, s2p-bi-run]
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v3
+      - name: check node & npm version
+        run: |
+          pwd
+          node -v
+          npm -v
+      - name: print branch name
+        run: | 
+          echo "Running on branch ${{github.ref_name}}"
+          echo "Running on branch ${{secrets.ADSCLOUD_PASSWORD}}"
+      - name: Run Setup
+        run: |
+          pwd 
+          which dotnet 
+          ls 
+          dotnet --info
+          dotnet cake build.cake --target="Default" --gitbranch="${{github.ref_name}}"
+  Build:
+    name: Build
+    needs: Setup
+    runs-on: [self-hosted, Linux, s2p-bi-run]
+    steps:
+      - name: publish - Web Services
+        run: |
+          cd ./Source/WebServices
+          dotnet restore -s http://novi.intel.com/nuget -s https://api.nuget.org/v3/index.json
+          dotnet build
+          dotnet publish -c Release -o publish -r "win81-x64"
+      - name: Run Docker for Web Internal & External
+        run: dotnet cake build.cake --target="Build" --gitbranch="${{github.ref_name}}"
+  Deploy:
+    name: Deploy
+    needs: [Setup, Build]
+    runs-on: [self-hosted, Linux, s2p-bi-run]
+    steps:
+      - name: Deploy to CF
+        run: dotnet cake build.cake --target="Deploy" --gitbranch="${{github.ref_name}}"
+  DeployCaaS:
+    name: DeployCaaS
+    runs-on: [self-hosted, Linux, s2p-bi-run]
+    container: "amr-registry.caas.intel.com/squirrels/nodelts-alpine-git-cf:1.0.0"
+    environment: ${{github.ref_name}}
+    needs: [Setup,Build,Deploy]
+    steps:
+      - name: Set Branch Variables
+        id: setvars
+        run: |
+          if [[ "${{github.ref}}" == "refs/heads/master" ]]; then
+            echo "::set-output name=app_name::ucm-test-tst"
+            echo "::set-output name=app_namespace::ucm-test-tst"
+            echo "::set-output name=app_env::PROD"
+            echo "::set-output name=app_nodePort::31411"
+            echo "::set-output name=app_cluster::amr-pre-compute-cluster"
+            echo "::set-output name=app_cluster_server::https://amr-pre.caas.intel.com/k8s/clusters/c-skrnn"
+            echo "::set-output name=caas_k8s_token::${{ secrets.K8S_TOKEN }}"
+            echo "::set-output name=ASPNETCORE_ENVIRONMENT::PROD"
+          fi
+      - name: Create deploy yaml file
+        run: |
+          cat >./deploy.yml <<EOL
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${{steps.setvars.outputs.app_name}}
+            namespace: ${{steps.setvars.outputs.app_namespace}}
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: ${{steps.setvars.outputs.app_name}}
+            strategy:
+              type: RollingUpdate
+              rollingUpdate:
+                maxUnavailable: 25%
+                maxSurge: 25%
+            template:
+              metadata:
+                labels:
+                  app: ${{steps.setvars.outputs.app_name}}
+              spec:
+                containers:
+                  - image: amr-registry.caas.intel.com/ucm1/webinternal:${{github.ref_name}}
+                    imagePullPolicy: Always
+                    name: ucm-container
+                    ports:
+                      - containerPort: 80
+                        protocol: TCP
+                    env:
+                      - name: ASPNETCORE_ENVIRONMENT
+                        value: ${{steps.setvars.outputs.ASPNETCORE_ENVIRONMENT}}
+                      - name: UCM_DB_LOGIN
+                        value: ${{steps.setvars.outputs.UCM_DB_LOGIN}}
+                      - name: UCM_APPDATA_LOGIN
+                        value: ${{steps.setvars.outputs.UCM_APPDATA_LOGIN}}
+                      - name: UCM_Azure_ClientSecret
+                        value: ${{steps.setvars.outputs.UCM_AZURE_CLIENTSECRET}}
+                      - name: UCM_EDW_LOGIN
+                        value: ${{steps.setvars.outputs.UCM_EDW_LOGIN}}
+                      - name: UCM_Iam__ClientId
+                        value: ${{steps.setvars.outputs.UCM_IAM_CLIENTID}}
+                      - name: UCM_Iam__ClientSecret
+                        value: ${{steps.setvars.outputs.UCM_IAM_CLIENTSECRET}}
+                      - name: UCM_Wds__Password
+                        value: ${{steps.setvars.outputs.UCM_WDS_PASSWORD}}
+                imagePullSecrets:
+                    - name: ucm-internal-secret
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: serv-${{steps.setvars.outputs.app_name}}
+          spec:
+            type: NodePort
+            selector:
+              app: ${{steps.setvars.outputs.app_name}}
+            ports:
+            - port: 80
+              targetPort: 80
+              nodePort: ${{steps.setvars.outputs.app_nodePort}}
+              protocol: TCP
+          ---
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:  
+            name: ing-${{steps.setvars.outputs.app_name}}
+            namespace: ${{steps.setvars.outputs.app_namespace}}
+          spec:
+            defaultBackend:
+              service:
+                name: serv-${{steps.setvars.outputs.app_name}}
+                port:
+                  number: 80
+            rules:
+              - host: ${{steps.setvars.outputs.app_name}}.intel.com
+                http:
+                  paths:
+                    - backend:
+                        service:
+                          name: serv-${{steps.setvars.outputs.app_name}}
+                          port:
+                            number: 80
+                      path: /
+                      pathType: Prefix
+            tls:
+              - hosts:
+                  - ${{steps.setvars.outputs.app_name}}.intel.com
+                secretName: ${{steps.setvars.outputs.app_name}}-cert
+          ---
+          EOL
+      - name: Print deploy.yml content
+        run: cat ./deploy.yml
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: "latest"
+      - name: Deploy to CaaS
+        run: |
+          unset KUBECONFIG
+          rm -f ~/.kube/config
+          kubectl config set-cluster ${{steps.setvars.outputs.app_cluster}} --server=${{steps.setvars.outputs.app_cluster_server}} --insecure-skip-tls-verify=true
+          kubectl config set-credentials user --token=${{steps.setvars.outputs.caas_k8s_token }}
+          kubectl config set-context default --cluster=${{steps.setvars.outputs.app_cluster}} --user=user
+          kubectl config use-context default
+          kubectl apply -f deploy.yml -n ${{steps.setvars.outputs.app_namespace}}
+          kubectl rollout restart deployment ${{steps.setvars.outputs.app_name}} -n ${{steps.setvars.outputs.app_namespace}}
+          echo 'Deploy Finished'
